@@ -1,297 +1,234 @@
-import json
-import csv
-import os
-from pandas import options
-from selenium import webdriver
+import os, csv, json, time, requests
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
 
 
-# ==========================
-# 🔧 Setup Driver
-# ==========================
-def setup_driver(headless=False):
+# =====================================================
+#  SETUP DRIVER UNTUK LOKAL
+# =====================================================
+def setup_driver_local(headless=True):
     options = Options()
     if headless:
         options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--window-size=1600,900")
+    options.add_argument("--blink-settings=imagesEnabled=false")
     options.add_argument("--log-level=3")
-    options.page_load_strategy = "eager"
-    driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(30)
+    driver = uc.Chrome(options=options)
+    driver.set_page_load_timeout(25)
     return driver
 
-def get_table_rows(driver, url):
-    """Helper untuk ambil semua baris dari tabel referensi"""
-    driver.get(url)
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_all_elements_located((By.CSS_SELECTOR, "table#table1 tbody tr"))
-    )
-    try:
-        select = Select(driver.find_element(By.NAME, "table1_length"))
-        select.select_by_value("100")
-    except:
-        pass
-    return driver.find_elements(By.CSS_SELECTOR, "table#table1 tbody tr")
 
-# ==========================
-#  Ambil Kode Kecamatan dari JSON
-# ==========================
-def get_kode_kecamatan_from_json(nama_kecamatan, json_path="../list_kecamatan/kecamatan_kab_semarang.json"):
+# =====================================================
+#  KODE KECAMATAN
+# =====================================================
+def get_kode_kecamatan_from_json(nama_kecamatan, json_path="./list_kecamatan/kecamatan_kab_semarang.json"):
     try:
-        # Buka file JSON
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        if not data:
-            print("File JSON kosong.")
-            return None
-
         nama_wilayah = next(iter(data))
-        kabupaten_data = data[nama_wilayah].get("kecamatan", {})
-
-        # Cari kecamatan
-        for nama, kode in kabupaten_data.items():
-            if nama.lower() == nama_kecamatan.lower():
-                return kode
-
-        print(f"Kecamatan '{nama_kecamatan}' tidak ditemukan di {nama_wilayah}.")
-        return None
-
-    except FileNotFoundError:
-        print(f"File JSON '{json_path}' tidak ditemukan.")
-        return None
-
+        return data[nama_wilayah]["kecamatan"].get(nama_kecamatan)
     except Exception as e:
-        print(f"Error saat membaca JSON: {e}")
+        print("JSON error:", e)
         return None
 
 
+# =====================================================
+#  OPTIMIZED REQUEST SESSION (keep-alive pool)
+# =====================================================
+def create_fast_session():
+    s = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=2)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121 Safari/537.36"
+    })
+    return s
 
-# ==========================
-# 🔍 Ambil data Siswa Laki-laki, Kepsek, Alamat dari website sekolah kita kemendikbud
-# ==========================
-def get_detail(driver):
-    alamat, kepsek, siswa_laki, siswa_perempuan = "-", "-", "-", "-"
 
+# =====================================================
+#  FETCH TAB-4 (KONTAK)
+# =====================================================
+def fetch_contact(url, selected_fields, session):
+    result = {}
     try:
-        # Tunggu tab identitas muncul
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "label[for='tab-1']"))
-        )
-        rows_identitas = driver.find_elements(By.CSS_SELECTOR, "div.tabby-content table tr")
-
-        for rp in rows_identitas:
-            tds = rp.find_elements(By.CSS_SELECTOR, "td")
-            if len(tds) < 4:
-                continue
-
-            link_elem = tds[3].find_elements(By.TAG_NAME, "a")
-            if not link_elem:
-                continue
-
-            link_kemdikbud = link_elem[0].get_attribute("href")
-
-            #  Buka halaman sekolah.data.kemdikbud.go.id
-            driver.execute_script("window.open(arguments[0]);", link_kemdikbud)
-            driver.switch_to.window(driver.window_handles[-1])
-
-            try:
-                # Tunggu halaman profil terbuka
-                WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "h4.page-header"))
-                )
-
-                #  Ambil alamat
-                try:
-                    alamat_elem = driver.find_element(By.CSS_SELECTOR, "font.small")
-                    # Bersihkan teks tambahan seperti "(master referensi)"
-                    alamat_elem = alamat_elem.replace("(master referensi)", "").text.strip()
-                    alamat = alamat_elem if alamat_elem else "-"
-                except:
-                    alamat = "-"
-
-                #  Ambil Kepala Sekolah
-                try:
-                    kepsek_elem = driver.find_element(
-                        By.XPATH, "//li[contains(., 'Kepala Sekolah')]"
-                    )
-                    kepsek = kepsek_elem.text.split(":", 1)[-1].strip()
-                except:
-                    kepsek = "-"
-
-                #  Ambil jumlah siswa laki-laki
-                try:
-                    siswa_laki_elem = driver.find_element(
-                        By.XPATH,
-                        "//text()[contains(., 'Siswa Laki-laki')]/following::font[1]"
-                    )
-                    siswa_laki = siswa_laki_elem.text.strip()
-                except:
-                    siswa_laki = "-"
-                    
-                # Ambil jumlah siswa perempuan 
-                try:
-                    siswa_perempuan_elem = driver.find_element(
-                        By.XPATH,
-                        "//text()[contains(., 'Siswa Perempuan')]/following::font[1]"
-                    )
-                    siswa_perempuan = siswa_perempuan_elem.text.strip()
-                except:
-                    siswa_perempuan = "-"
-
-            except Exception as e:
-                print(f"Gagal ambil data di sekolah.data.kemdikbud.go.id: {e}")
-
-            # Tutup tab & kembali ke tab utama
-            driver.close()
-            driver.switch_to.window(driver.window_handles[-1])
-            break
-
-    except Exception as e:
-        print(f"Gagal proses tab identitas: {e}")
-
-    return alamat, kepsek, siswa_laki, siswa_perempuan
-
-
-# ==========================
-#  Ambil data kontak Referensi Data Kemendikbud
-# ==========================
-def get_kontak(driver):
-    telepon, email, website = "-", "-", "-"
-    try:
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "label[for='tab-4']"))
-        )
-        driver.find_element(By.CSS_SELECTOR, "label[for='tab-4']").click()
-        rows_kontak = driver.find_elements(By.CSS_SELECTOR, "div.tabby-content table tr")
-
-        for row in rows_kontak:
-            tds = row.find_elements(By.CSS_SELECTOR, "td")
-            if len(tds) < 4:
-                continue
-            label = tds[1].text.strip().lower()
-            value = tds[3].text.strip() or "-"
-            if "telepon" in label:
-                telepon = value if len(value) >= 5 else "-"
-            elif "email" in label:
-                email = value
-            elif "website" in label:
-                val = value.lower()
-                website = "-" if val in ["http://-", "https://-"] else val
-    except:
+        resp = session.get(url, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        if any(f in selected_fields for f in ["Telepon", "Email", "Website"]):
+            for row in soup.select("table tr"):
+                tds = row.find_all("td")
+                if len(tds) >= 4:
+                    label = tds[1].get_text(strip=True).lower()
+                    val = tds[3].get_text(strip=True)
+                    if "telepon" in label:
+                        result["Telepon"] = val if len(val) > 4 else "-"
+                    elif "email" in label:
+                        result["Email"] = val
+                    elif "website" in label:
+                        result["Website"] = "-" if val in ["http://-", "https://-"] else val
+    except Exception:
         pass
-    return telepon, email, website
+    return result
 
 
-# ==========================
-#  Ambil Daftar Sekolah (SD & MI) dari Referensi Data Kemendikbud
-# ==========================
-def get_sd_mi_schools(kode_kecamatan, nama_kecamatan):
-    driver = setup_driver(headless=True)
-    sekolah_list = []
+# =====================================================
+#  FETCH PROFIL SEKOLAH (Tab-1 redirect)
+# =====================================================
+def fetch_school_profile(url_tabs, session):
+    result = {
+        "Alamat": "-", "Kepala Sekolah": "-",
+        "Jumlah Siswa Laki-laki": "-", "Jumlah Siswa Perempuan": "-"
+    }
+    try:
+        resp_ref = session.get(url_tabs, timeout=10)
+        soup_ref = BeautifulSoup(resp_ref.text, "html.parser")
+        link_tag = soup_ref.find("a", href=lambda x: x and "sekolah.data" in x)
+        if not link_tag:
+            return result
+
+        sekolah_url = link_tag["href"].strip()
+        resp = session.get(sekolah_url, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        alamat = soup.select_one("font.small")
+        if alamat:
+            result["Alamat"] = alamat.text.replace("(master referensi)", "").strip()
+
+        for li in soup.select("li.list-group-item"):
+            txt = li.get_text(strip=True)
+            if "Kepala Sekolah" in txt:
+                result["Kepala Sekolah"] = txt.split(":", 1)[-1].strip()
+                break
+
+        div_stat = soup.find("div", class_="col-xs-12 col-md-3 text-left")
+        if div_stat:
+            tag_m = div_stat.find(string=lambda t: "Siswa Laki-laki" in t)
+            if tag_m:
+                font_m = tag_m.find_next("font", class_="text-info")
+                if font_m:
+                    result["Jumlah Siswa Laki-laki"] = font_m.text.strip()
+            tag_f = div_stat.find(string=lambda t: "Siswa Perempuan" in t)
+            if tag_f:
+                font_f = tag_f.find_next("font", class_="text-info")
+                if font_f:
+                    result["Jumlah Siswa Perempuan"] = font_f.text.strip()
+
+    except Exception as e:
+        print(f"Gagal ambil profil sekolah: {e}")
+    return result
+
+
+# =====================================================
+#  MAIN SCRAPER (tanpa UI)
+# =====================================================
+def get_sd_mi_schools_fast_local(kode_kecamatan, nama_kecamatan, selected_fields):
+    driver = setup_driver_local(True)
+    session = create_fast_session()
+    sekolah_list, urls = [], []
+
+    need_detail = any(f in selected_fields for f in
+                      ["Alamat", "Kepala Sekolah", "Jumlah Siswa Laki-laki",
+                       "Jumlah Siswa Perempuan", "Telepon", "Email", "Website"])
 
     for jenjang, value in [("SD", "5"), ("MI", "9")]:
         url = f"https://referensi.data.kemendikdasmen.go.id/pendidikan/dikdas/{kode_kecamatan}/3/all/{value}/all"
-        print(f"Mengambil data {jenjang} dari: {url}")
+        print(f"Mengambil data {jenjang} - {nama_kecamatan}")
+        driver.get(url)
+        WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "table#table1 tbody tr")))
+
         try:
-            driver.get(url)
-            WebDriverWait(driver, 5).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "table#table1"))
-            )
+            Select(driver.find_element(By.NAME, "table1_length")).select_by_value("100")
+            time.sleep(0.5)
+        except:
+            pass
 
-            # Ubah tampilan jadi 100 baris
-            get_table_rows(driver, url)
-
-            rows = driver.find_elements(By.CSS_SELECTOR, "table#table1 tbody tr")
-            if not rows:
-                print(f"Tidak ada data {jenjang} di {nama_kecamatan}")
-                continue
-
-            for r in rows:
-                try:
-                    nama = r.find_element(By.CSS_SELECTOR, "td:nth-child(3)").text.strip()
-                    npsn = r.find_element(By.CSS_SELECTOR, "td:nth-child(2)").text.strip()
-                    status = r.find_element(By.CSS_SELECTOR, "td:nth-child(6)").text.strip()
-                    kelurahan = r.find_element(By.CSS_SELECTOR, "td:nth-child(5)").text.strip()
-                    href = r.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
-
-                    # Buka halaman detail
-                    driver.execute_script("window.open(arguments[0]);", href)
-                    driver.switch_to.window(driver.window_handles[-1])
-
-                    alamat, kepsek, siswa_laki, siswa_perempuan = get_detail(driver)
-                    telepon, email, website = get_kontak(driver)
-
-                    sekolah_list.append({
-                        "Kelurahan": kelurahan,
-                        "Nama Sekolah": nama,
-                        "NPSN": npsn,
-                        "Status": status,
-                        "Kepala Sekolah": kepsek,
-                        "Alamat": alamat,
-                        "Telepon": telepon,
-                        "Email": email,
-                        "Website": website,
-                        "Jumlah Siswa Laki-laki": siswa_laki,
-                        "Jumlah Siswa Perempuan": siswa_perempuan,
-                    })
-
-                    driver.close()
-                    driver.switch_to.window(driver.window_handles[0])
-
-                except Exception as e:
-                    print(f"Gagal proses {nama}: {e}")
-                    continue
-
-            print(f"{len(rows)} sekolah {jenjang} di {nama_kecamatan}")
-
-        except Exception as e:
-            print(f"Gagal ambil data {jenjang} di {nama_kecamatan}: {e}")
-            continue
+        for r in driver.find_elements(By.CSS_SELECTOR, "table#table1 tbody tr"):
+            data = {}
+            if "Nama Sekolah" in selected_fields:
+                data["Nama Sekolah"] = r.find_element(By.CSS_SELECTOR, "td:nth-child(3)").text.strip()
+            if "NPSN" in selected_fields:
+                data["NPSN"] = r.find_element(By.CSS_SELECTOR, "td:nth-child(2)").text.strip()
+            if "Status" in selected_fields:
+                data["Status"] = r.find_element(By.CSS_SELECTOR, "td:nth-child(6)").text.strip()
+            if "Kelurahan" in selected_fields:
+                data["Kelurahan"] = r.find_element(By.CSS_SELECTOR, "td:nth-child(5)").text.strip()
+            if need_detail:
+                link = r.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
+                urls.append((link, data))
+            else:
+                sekolah_list.append(data)
 
     driver.quit()
-    # 🧩 SORTING berdasarkan nama kelurahan
-    sekolah_list = sorted(sekolah_list, key=lambda x: x["Kelurahan"].lower())
+
+    if need_detail:
+        print(f"Fetch {len(urls)} sekolah secara paralel...")
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            futures = {
+                executor.submit(
+                    lambda l, base: {
+                        **base,
+                        **fetch_contact(l, selected_fields, session),
+                        **fetch_school_profile(l, session)
+                    }, link, base
+                ): (link, base) for link, base in urls
+            }
+            for i, f in enumerate(as_completed(futures), 1):
+                sekolah_list.append(f.result())
+                if i % 10 == 0:
+                    print(f"  → {i}/{len(futures)} sekolah selesai...")
+
+    if selected_fields:
+        sort_key = selected_fields[0]
+        sekolah_list.sort(key=lambda x: str(x.get(sort_key, "")).lower())
+
+    print(f"Total {len(sekolah_list)} sekolah dari {nama_kecamatan}")
     return sekolah_list
 
 
-# ==========================
-#  Simpan ke CSV
-# ==========================
-def save_school_list_by_kecamatan(nama_kecamatan):
-    nama_kecamatan = nama_kecamatan.strip()
-    kode_kecamatan = get_kode_kecamatan_from_json(nama_kecamatan)
-    if not kode_kecamatan:
-        return
+# =====================================================
+#  SAVE CSV (Backend callable)
+# =====================================================
+def scrape_sd_mi_by_kecamatan(nama_kecamatan, selected_fields):
+    kode = get_kode_kecamatan_from_json(nama_kecamatan)
+    if not kode:
+        raise ValueError(f"Kecamatan '{nama_kecamatan}' tidak ditemukan di JSON.")
 
-    print(f"Mengambil daftar SD & MI di Kecamatan {nama_kecamatan} (kode {kode_kecamatan})...")
-    sekolah_list = get_sd_mi_schools(kode_kecamatan, nama_kecamatan)
+    start = time.time()
+    data = get_sd_mi_schools_fast_local(kode, nama_kecamatan, selected_fields)
+    if not data:
+        return None, f"Tidak ada data untuk {nama_kecamatan}"
 
-    if not sekolah_list:
-        print(f"Tidak ditemukan SD atau MI di {nama_kecamatan}.")
-        return
+    os.makedirs("output", exist_ok=True)
+    path = f"output/list_sd_mi_{nama_kecamatan.lower().replace(' ', '_')}.csv"
+    cols = [c for c in [
+        "Kelurahan", "Nama Sekolah", "NPSN", "Status", "Kepala Sekolah",
+        "Alamat", "Telepon", "Email", "Website",
+        "Jumlah Siswa Laki-laki", "Jumlah Siswa Perempuan"
+    ] if c in selected_fields]
 
-    folder = "output"
-    os.makedirs(folder, exist_ok=True)
-    filename = f"list_sd_mi_{nama_kecamatan.lower().replace(' ', '_')}.csv"
-    fullpath = os.path.join(folder, filename)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(data)
 
-    with open(fullpath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "Kelurahan", "Nama Sekolah", "NPSN", "Status", "Kepala Sekolah", "Alamat", "Telepon", "Email", "Website", "Jumlah Siswa Laki-laki", "Jumlah Siswa Perempuan"
-        ])
-        writer.writeheader()
-        writer.writerows(sekolah_list)
-
-    print(f"✅ {len(sekolah_list)} sekolah disimpan ke '{fullpath}'")
+    dur = int(time.time() - start)
+    print(f"{len(data)} sekolah disimpan ke '{path}' ({dur}s)")
+    return path, f"{len(data)} data sekolah berhasil diambil."
 
 
+# =====================================================
+#  CONTOH PENGGUNAAN
+# =====================================================
 if __name__ == "__main__":
-    nama_kecamatan = "Ambarawa"
-    save_school_list_by_kecamatan(nama_kecamatan)
+    kecamatan = input("Masukkan nama kecamatan: ").strip()
+    selected = ["Nama Sekolah", "NPSN", "Status", "Kepala Sekolah",
+                "Alamat", "Telepon", "Email", "Website",
+                "Jumlah Siswa Laki-laki", "Jumlah Siswa Perempuan"]
+    scrape_sd_mi_by_kecamatan(kecamatan, selected)
