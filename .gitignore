@@ -1,2 +1,5 @@
 # Ignore Word docs
 *.docx
+*.doc
+*.pdf
+*.csv
